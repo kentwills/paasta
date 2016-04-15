@@ -820,6 +820,9 @@ class SystemPaastaConfig(dict):
         """
         return self.get('dockerfile_location', DEFAULT_DOCKERFILE_LOCATION)
 
+    def get_cluster_autoscaling_resources(self):
+        return self.get('cluster_autoscaling_resources', {})
+
 
 def _run(command, env=os.environ, timeout=None, log=False, stream=False, stdin=None, **kwargs):
     """Given a command, run it. Return a tuple of the return code and any

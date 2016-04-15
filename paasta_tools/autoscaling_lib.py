@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from math import ceil
+from math import floor
 
+import boto3
 import requests
 from kazoo.client import KazooClient
 from kazoo.exceptions import NoNodeError
@@ -30,45 +34,47 @@ from paasta_tools.marathon_tools import load_marathon_config
 from paasta_tools.marathon_tools import load_marathon_service_config
 from paasta_tools.marathon_tools import MESOS_TASK_SPACER
 from paasta_tools.marathon_tools import set_instances_for_marathon_service
+from paasta_tools.mesos_tools import get_mesos_state_from_leader
 from paasta_tools.mesos_tools import get_running_tasks_from_active_frameworks
+from paasta_tools.paasta_metastatus import get_mesos_utilization_for_attribute
 from paasta_tools.utils import _log
 from paasta_tools.utils import DEFAULT_SOA_DIR
 from paasta_tools.utils import get_services_for_cluster
 from paasta_tools.utils import load_system_paasta_config
 from paasta_tools.utils import ZookeeperPool
 
-_autoscaling_metrics_providers = {}
-_autoscaling_decision_policies = {}
+_autoscaling_components = defaultdict(dict)
 
-
-METRICS_PROVIDER_KEY = 'metrics_provider'
+SERVICE_METRICS_PROVIDER_KEY = 'service_metrics_provider'
+CLUSTER_METRICS_PROVIDER_KEY = 'cluster_metrics_provider'
 DECISION_POLICY_KEY = 'decision_policy'
+SCALER_KEY = 'scaler'
 
 AUTOSCALING_DELAY = 300
 
 
 def register_autoscaling_component(name, method_type):
-    if method_type == METRICS_PROVIDER_KEY:
-        component_dict = _autoscaling_metrics_providers
-    elif method_type == DECISION_POLICY_KEY:
-        component_dict = _autoscaling_decision_policies
-    else:
-        raise KeyError('Autoscaling component type %s does not exist.' % method_type)
-
     def outer(autoscaling_method):
-        component_dict[name] = autoscaling_method
+        _autoscaling_components[method_type][name] = autoscaling_method
         return autoscaling_method
     return outer
 
 
-def get_autoscaling_metrics_provider(name):
+def get_service_metrics_provider(name):
     """
-    Returns an metrics provider matching the given name.
+    Returns a service metrics provider matching the given name.
     """
-    return _autoscaling_metrics_providers[name]
+    return _autoscaling_components[SERVICE_METRICS_PROVIDER_KEY][name]
 
 
-def get_autoscaling_decision_policy(name):
+def get_cluster_metrics_provider(name):
+    """
+    Returns a cluster metrics provider matching the given name.
+    """
+    return _autoscaling_components[CLUSTER_METRICS_PROVIDER_KEY][name]
+
+
+def get_decision_policy(name):
     """
     Returns a decision policy matching the given name.
     Decision policies determine the direction a service needs to be scaled in.
@@ -77,7 +83,14 @@ def get_autoscaling_decision_policy(name):
     0:  don't autoscale
     1:  autoscale up
     """
-    return _autoscaling_decision_policies[name]
+    return _autoscaling_components[DECISION_POLICY_KEY][name]
+
+
+def get_scaler(name):
+    """
+    Returns a scaler matching the given name.
+    """
+    return _autoscaling_components[SCALER_KEY][name]
 
 
 class MetricsProviderNoDataError(ValueError):
@@ -85,7 +98,7 @@ class MetricsProviderNoDataError(ValueError):
 
 
 @register_autoscaling_component('threshold', DECISION_POLICY_KEY)
-def threshold_decision_policy(marathon_service_config, error, threshold=0.1, **kwargs):
+def threshold_decision_policy(error, threshold=0.1, **kwargs):
     """
     Decides to autoscale a service up or down if the service utilization exceeds the setpoint
     by a certain threshold.
@@ -105,7 +118,7 @@ def clamp_value(number):
 
 
 @register_autoscaling_component('pid', DECISION_POLICY_KEY)
-def pid_decision_policy(marathon_service_config, error, **kwargs):
+def pid_decision_policy(zookeeper_path, error, **kwargs):
     """
     Uses a PID to determine when to autoscale a service.
     See https://en.wikipedia.org/wiki/PID_controller for more information on PIDs.
@@ -116,13 +129,9 @@ def pid_decision_policy(marathon_service_config, error, **kwargs):
     Ki = 0.2 / AUTOSCALING_DELAY
     Kd = 0.05 * AUTOSCALING_DELAY
 
-    autoscaling_root = compose_autoscaling_zookeeper_root(
-        service=marathon_service_config.service,
-        instance=marathon_service_config.instance,
-    )
-    zk_iterm_path = '%s/pid_iterm' % autoscaling_root
-    zk_last_error_path = '%s/pid_last_error' % autoscaling_root
-    zk_last_time_path = '%s/pid_last_time' % autoscaling_root
+    zk_iterm_path = '%s/pid_iterm' % zookeeper_path
+    zk_last_error_path = '%s/pid_last_error' % zookeeper_path
+    zk_last_time_path = '%s/pid_last_time' % zookeeper_path
 
     with ZookeeperPool() as zk:
         try:
@@ -159,7 +168,7 @@ def pid_decision_policy(marathon_service_config, error, **kwargs):
     return int(round(clamp_value(Kp * error + iterm + Kd * (error - last_error) / time_delta)))
 
 
-@register_autoscaling_component('http', METRICS_PROVIDER_KEY)
+@register_autoscaling_component('http', SERVICE_METRICS_PROVIDER_KEY)
 def http_metrics_provider(marathon_service_config, marathon_tasks, mesos_tasks, endpoint='status', *args, **kwargs):
     """
     Gets the average utilization of a service across all of its tasks, where the utilization of
@@ -188,7 +197,7 @@ def http_metrics_provider(marathon_service_config, marathon_tasks, mesos_tasks, 
     return sum(utilization) / len(utilization)
 
 
-@register_autoscaling_component('mesos_cpu_ram', METRICS_PROVIDER_KEY)
+@register_autoscaling_component('mesos_cpu_ram', SERVICE_METRICS_PROVIDER_KEY)
 def mesos_cpu_ram_metrics_provider(marathon_service_config, marathon_tasks, mesos_tasks, **kwargs):
     """
     Gets the average utilization of a service across all of its tasks, where the utilization of
@@ -255,23 +264,7 @@ def mesos_cpu_ram_metrics_provider(marathon_service_config, marathon_tasks, meso
     return average_utilization
 
 
-def get_new_instance_count(current_instances, autoscaling_direction):
-    return int(ceil((1 + float(autoscaling_direction) / 10) * current_instances))
-
-
-def autoscale_marathon_instance(marathon_service_config, marathon_tasks, mesos_tasks):
-    current_instances = marathon_service_config.get_instances()
-    if len(marathon_tasks) != current_instances:
-        write_to_log(config=marathon_service_config,
-                     line='Delaying scaling as marathon is either waiting for resources or is delayed')
-    autoscaling_params = marathon_service_config.get_autoscaling_params()
-    autoscaling_metrics_provider = get_autoscaling_metrics_provider(autoscaling_params.pop(METRICS_PROVIDER_KEY))
-    autoscaling_decision_policy = get_autoscaling_decision_policy(autoscaling_params.pop(DECISION_POLICY_KEY))
-
-    error = autoscaling_metrics_provider(marathon_service_config, marathon_tasks,
-                                         mesos_tasks, **autoscaling_params) - autoscaling_params.pop('setpoint')
-    write_to_log(config=marathon_service_config, line='Recieved error from metrics provider: %f' % error)
-    autoscaling_direction = autoscaling_decision_policy(marathon_service_config, error, **autoscaling_params)
+def scale_service(autoscaling_direction, marathon_service_config, current_instances):
     if autoscaling_direction:
         autoscaling_amount = get_new_instance_count(current_instances, autoscaling_direction)
         instances = marathon_service_config.limit_instance_count(autoscaling_amount)
@@ -282,6 +275,42 @@ def autoscale_marathon_instance(marathon_service_config, marathon_tasks, mesos_t
                 instance=marathon_service_config.instance,
                 instance_count=instances,
             )
+
+
+def get_new_instance_count(current_instances, autoscaling_direction):
+    return int(ceil((1 + float(autoscaling_direction) / 10) * current_instances))
+
+
+def autoscale_marathon_instance(marathon_service_config, marathon_tasks, mesos_tasks):
+    current_instances = marathon_service_config.get_instances()
+    if len(marathon_tasks) != current_instances:
+        write_to_log(
+            config=marathon_service_config,
+            line='Delaying scaling as marathon is either waiting for resources or is delayed',
+        )
+        return
+
+    autoscaling_params = marathon_service_config.get_autoscaling_params()
+    metrics_provider = get_service_metrics_provider(autoscaling_params.pop('metrics_provider'))
+    decision_policy = get_decision_policy(autoscaling_params.pop('decision_policy'))
+
+    error = metrics_provider(
+        marathon_service_config=marathon_service_config,
+        marathon_tasks=marathon_tasks,
+        mesos_tasks=mesos_tasks,
+        **autoscaling_params
+    ) - autoscaling_params.pop('setpoint')
+    write_to_log(config=marathon_service_config, line='Recieved setpoint difference from metrics provider: %f' % error)
+
+    autoscaling_direction = decision_policy(
+        zookeeper_path=compose_autoscaling_zookeeper_root(
+            service=marathon_service_config.service,
+            instance=marathon_service_config.instance,
+        ),
+        error=error,
+        **autoscaling_params
+    )
+    scale_service(autoscaling_direction, marathon_service_config, current_instances)
 
 
 def autoscale_services(soa_dir=DEFAULT_SOA_DIR):
@@ -362,3 +391,92 @@ def create_autoscaling_lock():
         lock.release()
     finally:
         zk.stop()
+
+
+@register_autoscaling_component('aws_spot_fleet_request', CLUSTER_METRICS_PROVIDER_KEY)
+def spotfleet_metrics_provider(spotfleet_request_id, mesos_state, pool):
+    def slave_pid_to_ip(slave_pid):
+        regex = re.compile(r'.+?@([\d\.]+):\d+')
+        return regex.match(slave_pid).group(1)
+
+    ec2_client = boto3.client('ec2')
+    spot_fleet_instances = ec2_client.describe_spot_fleet_instances(
+        SpotFleetRequestId=spotfleet_request_id)['ActiveInstances']
+    desired_instances = len(spot_fleet_instances)
+    instance_ips = {
+        instance['PrivateIpAddress']
+        for reservation in ec2_client.describe_instances(
+            InstanceIds=[instance['InstanceId'] for instance in spot_fleet_instances])['Reservations']
+        for instance in reservation['Instances']
+    }
+    slaves = {
+        slave['id']: slave for slave in mesos_state.get('slaves', [])
+        if slave_pid_to_ip(slave['pid']) in instance_ips and
+        slave['attributes'].get('pool', 'default') == pool
+    }
+    current_instances = len(slaves)
+    print "Found %d slaves registered in mesos out of %d in spot fleet" % (current_instances, desired_instances)
+    if float(current_instances) / desired_instances < 0.7:
+        raise ClusterAutoscalingError('Not enough slaves registered in mesos to autoscale safely.')
+    tasks = [
+        task
+        for framework in mesos_state.get('frameworks', [])
+        for task in framework.get('tasks', [])
+        if task['slave_id'] in slaves
+    ]
+    pool_resources_dict = get_mesos_utilization_for_attribute(slaves.values(), tasks, 'pool')
+    free_pool_resources = pool_resources_dict['free'][pool]
+    total_pool_resources = pool_resources_dict['total'][pool]
+    utilization = 1.0 - min((float(free_pool_resources[resource]) / total_pool_resources[resource]
+                             for resource in free_pool_resources.keys()
+                             if resource in total_pool_resources))
+    return utilization
+
+
+@register_autoscaling_component('aws_spot_fleet_request', SCALER_KEY)
+def spotfleet_scaler(resource, error):
+    ec2_client = boto3.client('ec2')
+    spot_fleet_request = ec2_client.describe_spot_fleet_requests(
+        SpotFleetRequestIds=[resource['id']])['SpotFleetRequestConfigs'][0]
+    if spot_fleet_request['SpotFleetRequestState'] != 'active':
+        raise ClusterAutoscalingError('Can not scale non-active spot fleet requests.')
+    current_capacity = spot_fleet_request['SpotFleetRequestConfig']['TargetCapacity']
+    ideal_capacity = int(ceil((1 + error) * current_capacity))
+    new_capacity = min(
+        max(
+            resource['min_instances'],
+            floor(current_capacity * 0.9),
+            ideal_capacity,
+        ),
+        ceil(current_capacity * 1.1),
+        resource['max_instances'],
+    )
+    print "Spotfleet autoscaler dry run:"
+    if new_capacity != current_capacity:
+        print "Would scale %s from %d to %d" % (resource['id'], current_capacity, new_capacity)
+        # ec2_client.modify_spot_fleet_request(SpotFleetRequestId=resource['id'], TargetCapacity=new_capacity)
+    else:
+        print "Would not scale. Noop."
+
+
+class ClusterAutoscalingError(Exception):
+    pass
+
+
+def autoscale_local_cluster():
+    TARGET_UTILIZATION = 0.8
+
+    system_config = load_system_paasta_config()
+    autoscaling_resources = system_config.get_cluster_autoscaling_resources()
+    mesos_state = get_mesos_state_from_leader()
+    for identifier, resource in autoscaling_resources.items():
+        resource_metrics_provider = get_cluster_metrics_provider(resource['type'])
+        try:
+            utilization = resource_metrics_provider(resource['id'], mesos_state, resource['pool'])
+            print "Utilization for %s: %f%%" % (identifier, utilization * 100)
+            error = utilization - TARGET_UTILIZATION
+            if threshold_decision_policy(error):
+                resource_scaler = get_scaler(resource['type'])
+                resource_scaler(resource, error)
+        except ClusterAutoscalingError as e:
+            print '%s: %s' % (identifier, e)  # TODO: write to log
